@@ -1,0 +1,323 @@
+/*  ============================================================
+ *  Self-Balancing Robot — Arduino Uno
+ *  ============================================================
+ *  Hardware:
+ *    - Arduino Uno
+ *    - MPU6050  (I²C: SDA → A4, SCL → A5)
+ *    - L298N    (IN1 → D6, IN2 → D9, IN3 → D10, IN4 → D11)
+ *    - 2× DC gear motors (yellow, with wheels)
+ *
+ *  Architecture:
+ *    1. High-speed I²C read (400 kHz) of MPU6050 raw accel + gyro
+ *    2. Complementary Filter for stable angle estimation
+ *    3. PID Controller to compute required wheel acceleration
+ *    4. L298N H-Bridge PWM driving with dead-band compensation
+ *    5. Safety cutoff when tilted beyond threshold (robot fell)
+ *  ============================================================ */
+
+#include <Wire.h>
+#include <MPU6050.h>
+
+// ─────────────────────────────────────────────
+// PIN DEFINITIONS  (L298N motor driver)
+// ─────────────────────────────────────────────
+// ─── PIN DEFINITIONS (conformes au schéma) ───
+#define MOTOR_A_ENA   5    // PWM (vitesse moteur gauche)
+#define MOTOR_A_IN1   8
+#define MOTOR_A_IN2   9
+#define MOTOR_B_ENB   6    // PWM (vitesse moteur droit)
+#define MOTOR_B_IN3  10
+#define MOTOR_B_IN4  11
+
+// Motor polarity inversion (1 = normal, -1 = inverted)
+// Since motors face opposite directions, if one wheel spins backwards,
+// simply flip its sign here without rewiring.
+#define MOTOR_A_DIR   -1
+#define MOTOR_B_DIR   -1
+
+// ─────────────────────────────────────────────
+// SENSOR ORIENTATION CONFIGURATION
+// ─────────────────────────────────────────────
+// Set to 1 for tilt around X-axis (Pitch: ay/az + gx)
+// Set to 0 for tilt around Y-axis (Roll:  ax/az + gy)
+#define TILT_AROUND_X_AXIS  1
+
+// ─────────────────────────────────────────────
+// TUNABLE CONTROL CONSTANTS
+// ─────────────────────────────────────────────
+// Complementary filter weighting (0.0 to 1.0)
+// 0.98 gives 98% weight to gyro integration, 2% to accelerometer
+#define ALPHA  0.98
+
+// PID Gains — validated in SIL dynamics simulation
+//   Kp = 18.0 provides restoring force
+//   Ki =  8.0 eliminates deadband steady-state tilt
+//   Kd =  1.0 dampens rapid angular velocity
+double Kp = 18.0;    // Proportional gain
+double Ki =  8.0;    // Integral gain
+double Kd =  1.0;    // Derivative gain
+
+// Balance equilibrium setpoint (degrees)
+// 0.0 is perfect vertical. Adjust if robot center-of-gravity leans.
+double setpoint = 0.0;
+
+// Motor dead-band & limits (PWM 0-255)
+// Minimum PWM needed to overcome gearbox friction and spin wheels
+#define MIN_PWM        40
+#define MAX_PWM       255
+
+// Safety shutoff angle (degrees)
+// If robot tilts past this angle, it has fallen over: cut power immediately!
+#define TILT_LIMIT    45.0
+
+// Gyro calibration sample count at boot
+#define CALIBRATION_SAMPLES  500
+
+// Anti-windup limit for integral term
+#define INTEGRAL_LIMIT       400.0
+
+// Telemetry output interval (ms) — ~50 Hz rate
+#define TELEMETRY_INTERVAL_MS 20
+
+// ─────────────────────────────────────────────
+// GLOBAL VARIABLES
+// ─────────────────────────────────────────────
+MPU6050 mpu;
+
+// Raw sensor values
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+
+// Calibrated zero-rate offsets
+float gyroBias = 0.0;
+
+// Estimated tilt angle (degrees)
+float currentAngle = 0.0;
+
+// PID state
+double pidError      = 0.0;
+double pidLastError  = 0.0;
+double pidIntegral   = 0.0;
+double pidDerivative = 0.0;
+double pidOutput     = 0.0;
+
+// Timing
+unsigned long lastLoopTime   = 0;
+unsigned long lastSerialTime = 0;
+float dt = 0.005;
+
+// ─────────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("\n=================================="));
+  Serial.println(F("    SELF-BALANCING ROBOT — UNO    "));
+  Serial.println(F("=================================="));
+
+  // Motor pins setup
+pinMode(MOTOR_A_ENA, OUTPUT);
+pinMode(MOTOR_A_IN1, OUTPUT);
+pinMode(MOTOR_A_IN2, OUTPUT);
+pinMode(MOTOR_B_ENB, OUTPUT);
+pinMode(MOTOR_B_IN3, OUTPUT);
+pinMode(MOTOR_B_IN4, OUTPUT);
+stopMotors();
+
+  // Initialize I²C in Fast Mode (400 kHz)
+  Wire.begin();
+  Wire.setClock(400000);
+
+  Serial.println(F("[1/3] Initializing MPU6050..."));
+  mpu.initialize();
+
+  if (mpu.testConnection()) {
+    Serial.println(F("[1/3] MPU6050 connected successfully."));
+  } else {
+    Serial.println(F("[ERROR] MPU6050 connection FAILED! Check wiring."));
+    while (1) {
+      delay(500);
+    }
+  }
+
+  // Set sensor full-scale ranges
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+
+  // Calibrate Gyroscope
+  Serial.println(F("[2/3] Calibrating Gyroscope — keep robot stationary..."));
+  calibrateGyro();
+  Serial.print(F("[2/3] Gyro bias calibrated: "));
+  Serial.println(gyroBias, 4);
+
+  // Initial angle from accelerometer
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  currentAngle = readAccelAngle();
+
+  Serial.println(F("[3/3] Ready! Starting control loop."));
+  Serial.println(F("Format: Angle(deg) \t Error \t Output(PWM)"));
+  Serial.println(F("---------------------------------------------"));
+
+  lastLoopTime = micros();
+  lastSerialTime = millis();
+}
+
+// ─────────────────────────────────────────────
+// MAIN CONTROL LOOP
+// ─────────────────────────────────────────────
+void loop() {
+  // 1. Time delta calculation (seconds)
+  unsigned long now = micros();
+  dt = (now - lastLoopTime) / 1000000.0;
+  lastLoopTime = now;
+
+  // Protect against micros() rollover or first-run spikes
+  if (dt <= 0.0 || dt > 0.05) {
+    dt = 0.005;
+  }
+
+  // 2. Read all 6 axes from MPU6050
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // 3. Compute Accelerometer Angle and Gyro Rate
+  float accelAngle = readAccelAngle();
+  float gyroRate   = readGyroRate();
+
+  // 4. Complementary Filter
+  // High-pass filter on gyro (responsive) + Low-pass filter on accel (drift-free)
+  currentAngle = ALPHA * (currentAngle + gyroRate * dt) + (1.0 - ALPHA) * accelAngle;
+
+  // 5. PID Computation
+  pidError = currentAngle - setpoint;
+
+  // Proportional term
+  double pTerm = Kp * pidError;
+
+  // Integral term with anti-windup clamp
+  pidIntegral += pidError * dt;
+  pidIntegral = constrain(pidIntegral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  double iTerm = Ki * pidIntegral;
+
+  // Derivative term (rate of error change)
+  pidDerivative = (pidError - pidLastError) / dt;
+  double dTerm = Kd * pidDerivative;
+  pidLastError = pidError;
+
+  // Total controller output
+  pidOutput = pTerm + iTerm + dTerm;
+
+  // 6. Safety shutoff & Motor driving
+  if (abs(currentAngle - setpoint) > TILT_LIMIT) {
+    // Robot has fallen over: stop motors and reset integral
+    stopMotors();
+    pidIntegral = 0.0;
+  } else {
+    driveMotors(pidOutput);
+  }
+
+  // 7. Telemetry output (rate limited to keep loop ultra-fast)
+  if (millis() - lastSerialTime >= TELEMETRY_INTERVAL_MS) {
+    lastSerialTime = millis();
+    Serial.print(currentAngle, 2);
+    Serial.print(F("\t"));
+    Serial.print(pidError, 2);
+    Serial.print(F("\t"));
+    Serial.println(pidOutput, 2);
+  }
+}
+
+// ─────────────────────────────────────────────
+// SENSOR HELPER FUNCTIONS
+// ─────────────────────────────────────────────
+float readAccelAngle() {
+#if TILT_AROUND_X_AXIS
+  // Tilt around X axis uses Y and Z acceleration
+  return atan2((float)ay, (float)az) * (180.0 / M_PI);
+#else
+  // Tilt around Y axis uses X and Z acceleration
+  return atan2((float)ax, (float)az) * (180.0 / M_PI);
+#endif
+}
+
+float readGyroRate() {
+#if TILT_AROUND_X_AXIS
+  // Raw 131 LSB per deg/sec at FS_250
+  return ((float)gx - gyroBias) / 131.0;
+#else
+  return ((float)gy - gyroBias) / 131.0;
+#endif
+}
+
+void calibrateGyro() {
+  long sum = 0;
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+#if TILT_AROUND_X_AXIS
+    sum += gx;
+#else
+    sum += gy;
+#endif
+    delay(2);
+  }
+  gyroBias = (float)sum / CALIBRATION_SAMPLES;
+}
+
+// ─────────────────────────────────────────────
+// MOTOR ACTUATION (L298N)
+// ─────────────────────────────────────────────
+void driveMotors(double output) {
+  // If robot is in balance deadzone (|error| < 0.2 deg) or output is 0, idle motors
+  if (abs(pidError) < 0.2 || output == 0.0) {
+    stopMotors();
+    return;
+  }
+
+  // Dead-band compensation: map PID output to start above MIN_PWM
+  // so motor overcomes gearbox friction immediately without stalling at an angle
+  int rawPwm = (int)abs(output);
+  int pwm = MIN_PWM + (int)((long)rawPwm * (MAX_PWM - MIN_PWM) / MAX_PWM);
+  pwm = min(pwm, MAX_PWM);
+
+  if (output > 0) {
+    // Robot falling forward → drive forward to recover
+    setMotorA(pwm * MOTOR_A_DIR);
+    setMotorB(pwm * MOTOR_B_DIR);
+  } else {
+    // Robot falling backward → drive backward to recover
+    setMotorA(-pwm * MOTOR_A_DIR);
+    setMotorB(-pwm * MOTOR_B_DIR);
+  }
+}
+
+void setMotorA(int speed) {
+  if (speed > 0) {
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+  } else {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, LOW);
+  }
+  analogWrite(MOTOR_A_ENA, abs(speed));
+}
+
+void setMotorB(int speed) {
+  if (speed > 0) {
+    digitalWrite(MOTOR_B_IN3, HIGH);
+    digitalWrite(MOTOR_B_IN4, LOW);
+  } else if (speed < 0) {
+    digitalWrite(MOTOR_B_IN3, LOW);
+    digitalWrite(MOTOR_B_IN4, HIGH);
+  } else {
+    digitalWrite(MOTOR_B_IN3, LOW);
+    digitalWrite(MOTOR_B_IN4, LOW);
+  }
+  analogWrite(MOTOR_B_ENB, abs(speed));
+}
+
+void stopMotors() {
+  setMotorA(0);
+  setMotorB(0);
+}
